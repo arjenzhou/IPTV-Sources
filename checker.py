@@ -10,6 +10,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 
 import requests
+from urllib.parse import urljoin
 from tqdm import tqdm
 
 logger = logging.getLogger("IPTV-Checker")
@@ -59,14 +60,14 @@ class IPTVSourceChecker:
         self.state[url] = st
 
     # ---------------- 两段式检测 ----------------
-    def _probe(self, url):
-        """第一段：HTTP 预检，只取首包，顺带拿 playlist 文本"""
+    def _fetch(self, url, headers=None):
+        """取响应前 8KB，返回 (ok, text, reason)"""
         try:
-            with requests.get(
-                url, stream=True, timeout=self.probe_timeout,
-                headers={"User-Agent": self.config.get("user_agent", "Mozilla/5.0")},
-                allow_redirects=True,
-            ) as r:
+            h = {"User-Agent": self.config.get("user_agent", "Mozilla/5.0")}
+            if headers:
+                h.update(headers)
+            with requests.get(url, stream=True, timeout=self.probe_timeout,
+                              headers=h, allow_redirects=True) as r:
                 if r.status_code not in (200, 206):
                     return False, "", f"http_{r.status_code}"
                 head = b""
@@ -74,17 +75,81 @@ class IPTVSourceChecker:
                     head += chunk
                     if len(head) >= 8192:
                         break
-                text = head.decode("utf-8", "ignore")
-                low = text.lstrip().lower()
-                if low.startswith(("<!doctype", "<html")):
-                    return False, "", "html_page"
-                if "#ext" not in low and len(head) < 256:
-                    return False, "", "not_playlist"
-                return True, text, ""
+                return True, head.decode("utf-8", "ignore"), ""
         except requests.Timeout:
             return False, "", "timeout"
         except Exception:
             return False, "", "probe_error"
+
+    def _probe_segment(self, base, text):
+        """HLS 深层预检：取一个分片验证是否还有活流（比 ffprobe 便宜得多）"""
+        lines = [l.strip() for l in text.splitlines() if l.strip()]
+        if "#EXT-X-ENDLIST" in text:
+            return False, "vod_endlist"          # 已结束的点播
+        # master playlist：先挑码率最高的一路
+        if "#EXT-X-STREAM-INF" in text:
+            best_bw, best_uri = -1, None
+            for i, l in enumerate(lines):
+                if not l.startswith("#EXT-X-STREAM-INF"):
+                    continue
+                m = re.search(r"BANDWIDTH=(\d+)", l)
+                bw = int(m.group(1)) if m else 0
+                for nxt in lines[i + 1:]:
+                    if not nxt.startswith("#"):
+                        if bw > best_bw:
+                            best_bw, best_uri = bw, nxt
+                        break
+            if not best_uri:
+                return False, "no_variant"
+            ok, text, reason = self._fetch(urljoin(base, best_uri))
+            if not ok:
+                if reason in ("http_404", "http_403", "http_410"):
+                    return False, f"variant_{reason}"
+                return True, ""              # 不确定，交给 ffprobe 复核
+            lines = [l.strip() for l in text.splitlines() if l.strip()]
+        # media playlist：取第一个分片
+        seg = next((l for l in lines if not l.startswith("#")), None)
+        if not seg:
+            return False, "no_segment"
+        try:
+            with requests.get(urljoin(base, seg), stream=True,
+                              timeout=self.probe_timeout,
+                              headers={"User-Agent": self.config.get("user_agent", "Mozilla/5.0"),
+                                       "Range": "bytes=0-4095"},
+                              allow_redirects=True) as r:
+                if r.status_code in (404, 403, 410):
+                    return False, f"seg_http_{r.status_code}"
+                data = next(r.iter_content(2048), b"")
+                if not data:
+                    return False, "seg_empty"
+                if data[:1] == b"\x47":        # TS 同步字
+                    return True, ""
+                if b"ftyp" in data[:64] or b"moof" in data[:64] or data[:3] == b"ID3" or data[:1] == b"\xff":
+                    return True, ""
+                if data.lstrip()[:1] == b"<":
+                    return False, "seg_html"
+                return True, ""
+        except requests.Timeout:
+            return True, ""                  # 超时不算死，交给 ffprobe
+        except Exception:
+            return True, ""
+
+    def _probe(self, url):
+        """第一段：HTTP 预检 + HLS 分片验证"""
+        ok, text, reason = self._fetch(url)
+        if not ok:
+            return False, "", reason
+        low = text.lstrip().lower()
+        if low.startswith(("<!doctype", "<html")):
+            return False, "", "html_page"
+        if "#ext" not in low:
+            return True, text, ""        # 非 HLS 裸流，交给 ffprobe
+        if not self.config.get("deep_precheck", True):
+            return True, text, ""
+        ok, reason = self._probe_segment(url, text)
+        if not ok:
+            return False, "", reason
+        return True, text, ""
 
     @staticmethod
     def _quality_from_playlist(text):
@@ -110,7 +175,7 @@ class IPTVSourceChecker:
                 start = time.time()
                 r = subprocess.run(
                     [self.ffprobe, "-v", "quiet", "-print_format", "json", "-show_streams",
-                     "-analyzeduration", "1000000", "-probesize", "500000", "-i", url],
+                     "-analyzeduration", "1500000", "-probesize", "1500000", "-i", url],
                     capture_output=True, timeout=timeout)
                 latency = time.time() - start
                 if r.returncode != 0:
