@@ -9,3 +9,4 @@ data/output/collected_sources.json
 logs/
 __pycache__/
 config.full.json
+data/output/
