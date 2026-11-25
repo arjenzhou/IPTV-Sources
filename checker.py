@@ -1,49 +1,87 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""直播源检测：两段式预检 + 跨轮失败退避 + 画质提取 + 只对候选做静态画面检测"""
 
-import os
-import time
-import re
-import logging
-import subprocess
 import json
-import requests
+import logging
+import re
+import subprocess
+import time
 from concurrent.futures import ThreadPoolExecutor
+
+import requests
 from tqdm import tqdm
 
 logger = logging.getLogger("IPTV-Checker")
 
 
 class IPTVSourceChecker:
-    def __init__(self, config):
+    def __init__(self, config, state=None, round_no=0):
         self.config = config
-        self.results = {}  # {频道ID: {"info": info, "sources": [(URL, 是否有效, 延迟, 画质)]}}
+        self.state = state if state is not None else {}
+        self.round = round_no
+        self.ffmpeg = config.get("ffmpeg_bin", "ffmpeg")
+        self.ffprobe = config.get("ffprobe_bin", "ffprobe")
+        self.probe_timeout = config.get("probe_timeout", 3)
+        self.check_timeout = config.get("check_timeout", 4)
+        self.probe_workers = config.get("probe_workers", 64)
+        self.workers = config.get("max_workers", 12)
+        self.top_n = config.get("static_check_top_n", 3)
+        self.max_gap = config.get("retest_backoff_max", 8)
+        self.force_days = config.get("force_retest_days", 7)
 
-    # ---------- 第一段：轻量 HTTP 预检 + 顺手读 master playlist 的画质 ----------
+    # ---------------- 退避策略 ----------------
+    def _should_skip(self, url, now):
+        st = self.state.get(url)
+        if not st:
+            return False
+        if st.get("ok"):
+            return False                      # 上轮成功，必须每轮复测
+        if st.get("reason") == "timeout" and self.config.get("timeout_always_retest", True):
+            return False                      # 超时类多为抖动，不降频
+        fails = max(int(st.get("fails", 1)), 1)
+        gap = min(2 ** (fails - 1), self.max_gap)
+        if self.round - int(st.get("round", 0)) >= gap:
+            return False                      # 到期复测
+        # 兜底：太久没测过就强制测一次
+        return (now - float(st.get("ts", 0))) < self.force_days * 86400
+
+    def _remember(self, url, ok, reason, now):
+        st = self.state.get(url, {})
+        st["round"] = self.round
+        st["ts"] = now
+        if ok:
+            st.update({"ok": 1, "fails": 0, "reason": ""})
+        else:
+            st["ok"] = 0
+            st["fails"] = int(st.get("fails", 0)) + 1
+            st["reason"] = reason
+        self.state[url] = st
+
+    # ---------------- 两段式检测 ----------------
     def _probe(self, url):
-        """只取首包；返回 (是否可用, 头部文本)"""
+        """第一段：HTTP 预检，只取首包，顺带拿 playlist 文本"""
         try:
             with requests.get(
-                url,
-                stream=True,
-                timeout=self.config.get("probe_timeout", 3),
+                url, stream=True, timeout=self.probe_timeout,
                 headers={"User-Agent": self.config.get("user_agent", "Mozilla/5.0")},
                 allow_redirects=True,
             ) as r:
                 if r.status_code not in (200, 206):
-                    return False, ""
+                    return False, "", f"http_{r.status_code}"
                 head = b""
                 for chunk in r.iter_content(2048):
                     head += chunk
                     if len(head) >= 8192:
                         break
-                return True, head.decode("utf-8", "ignore")
+                return True, head.decode("utf-8", "ignore"), ""
+        except requests.Timeout:
+            return False, "", "timeout"
         except Exception:
-            return False, ""
+            return False, "", "probe_error"
 
     @staticmethod
     def _quality_from_playlist(text):
-        """从 m3u8 master playlist 提取最高档的 RESOLUTION/BANDWIDTH"""
         if "#EXT-X-STREAM-INF" not in text:
             return {}
         best = {"height": 0, "bitrate": 0}
@@ -58,101 +96,126 @@ class IPTVSourceChecker:
                 best = {"height": h, "bitrate": b}
         return best
 
-    def check(self, channels):
-        logger.info(f"开始检查 {len(channels)} 个频道的直播源...")
-        check_tasks = []
-        for channel_id, (info, urls) in channels.items():
-            for url in urls:
-                check_tasks.append((channel_id, info, url))
-
-        logger.info(f"共 {len(check_tasks)} 个直播源需要检查")
-        with ThreadPoolExecutor(max_workers=self.config["max_workers"]) as executor:
-            futures = {executor.submit(self._check_source, task[2]): task for task in check_tasks}
-            with tqdm(total=len(futures), desc="检查直播源") as pbar:
-                for future in futures:
-                    channel_id, info, url = futures[future]
-                    try:
-                        is_valid, latency, quality = future.result()
-                        if channel_id not in self.results:
-                            self.results[channel_id] = {"info": info, "sources": []}
-                        self.results[channel_id]["sources"].append((url, is_valid, latency, quality))
-                    except Exception as e:
-                        logger.error(f"检查任务失败: {channel_id}, {url}, 错误: {str(e)}")
-                        if channel_id not in self.results:
-                            self.results[channel_id] = {"info": info, "sources": []}
-                        self.results[channel_id]["sources"].append((url, False, float("inf"), {}))
-                    finally:
-                        pbar.update(1)
-
-        total_channels = len(self.results)
-        valid_channels = sum(1 for r in self.results.values() if any(s[1] for s in r["sources"]))
-        total_sources = sum(len(r["sources"]) for r in self.results.values())
-        valid_sources = sum(sum(1 for s in r["sources"] if s[1]) for r in self.results.values())
-        logger.info("直播源检查完成")
-        logger.info(f"频道统计: {valid_channels}/{total_channels} 个频道有效")
-        logger.info(f"直播源统计: {valid_sources}/{total_sources} 个直播源有效")
-        return self.results
-
-    def _check_source(self, url):
-        """返回 (是否有效, 延迟, 画质dict)"""
-        try:
-            # 第一段：HTTP 预检，不通就不浪费 ffprobe
-            ok, head = self._probe(url)
-            if not ok:
-                return False, float("inf"), {}
-            quality = self._quality_from_playlist(head)
-
-            start_time = time.time()
-            cmd = ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_streams", "-i", url]
-            result = subprocess.run(cmd, capture_output=True, timeout=self.config["check_timeout"])
-            latency = time.time() - start_time
-
-            if result.returncode != 0:
-                return False, float("inf"), {}
-
+    def _ffprobe(self, url, quality):
+        """第二段：ffprobe 确认有视频流；超时重试一次"""
+        for attempt in (0, 1):
+            timeout = self.check_timeout * (1.5 if attempt else 1)
             try:
-                output = result.stdout.decode("utf-8", errors="ignore")
-                stream_info = json.loads(output) if output else {}
-            except json.JSONDecodeError:
-                return False, float("inf"), {}
+                start = time.time()
+                r = subprocess.run(
+                    [self.ffprobe, "-v", "quiet", "-print_format", "json", "-show_streams", "-i", url],
+                    capture_output=True, timeout=timeout)
+                latency = time.time() - start
+                if r.returncode != 0:
+                    return False, float("inf"), {}, "ffprobe_fail"
+                info = json.loads(r.stdout.decode("utf-8", "ignore") or "{}")
+                streams = info.get("streams", [])
+                if not any(s.get("codec_type") == "video" for s in streams):
+                    return False, float("inf"), {}, "no_video"
+                if not quality:
+                    h = br = 0
+                    for s in streams:
+                        if s.get("codec_type") != "video":
+                            continue
+                        h = max(h, int(s.get("height") or 0))
+                        try:
+                            br = max(br, int(s.get("bit_rate") or 0))
+                        except (TypeError, ValueError):
+                            pass
+                    quality = {"height": h, "bitrate": br}
+                return True, latency, quality, ""
+            except subprocess.TimeoutExpired:
+                if attempt:
+                    return False, float("inf"), {}, "timeout"
+            except Exception:
+                return False, float("inf"), {}, "ffprobe_error"
+        return False, float("inf"), {}, "timeout"
 
-            streams = stream_info.get("streams", [])
-            has_video = any(s.get("codec_type") == "video" for s in streams)
-            if not has_video:
-                return False, float("inf"), {}
-
-            # playlist 里没写画质（普通 media playlist）时，用 ffprobe 读到的补上
-            if not quality:
-                h = 0
-                br = 0
-                for s in streams:
-                    if s.get("codec_type") != "video":
-                        continue
-                    h = max(h, int(s.get("height") or 0))
-                    try:
-                        br = max(br, int(s.get("bit_rate") or 0))
-                    except (TypeError, ValueError):
-                        pass
-                quality = {"height": h, "bitrate": br}
-
-            if self._is_static_stream(url):
-                return False, float("inf"), {}
-            return True, latency, quality
-
-        except subprocess.TimeoutExpired:
-            return False, float("inf"), {}
-        except Exception as e:
-            logger.debug(f"检查出错: {url}, 错误: {str(e)}")
-            return False, float("inf"), {}
-
-    def _is_static_stream(self, url):
-        """取 6 秒视频，画面冻结超 4 秒判定为静态"""
+    def _is_static(self, url):
         try:
-            cmd = ["ffmpeg", "-i", url, "-t", "6", "-vf", "freezedetect=n=0.001:d=4",
-                   "-an", "-f", "null", "-"]
-            result = subprocess.run(cmd, capture_output=True, timeout=20, text=True)
-            return "freeze_start" in result.stderr
-        except subprocess.TimeoutExpired:
-            return False
+            r = subprocess.run(
+                [self.ffmpeg, "-i", url, "-t", "6", "-vf", "freezedetect=n=0.001:d=4",
+                 "-an", "-f", "null", "-"],
+                capture_output=True, timeout=20, text=True)
+            return "freeze_start" in (r.stderr or "")
         except Exception:
             return False
+
+    def _rank_key(self, item):
+        lat, q = item["latency"], item.get("quality") or {}
+        thr = self.config.get("latency_threshold", 3.0)
+        return (0 if lat <= thr else 1, -int(q.get("height", 0)), -int(q.get("bitrate", 0)), lat)
+
+    def check(self, channels):
+        now = time.time()
+        tasks, skipped = [], 0
+        for channel_id, (info, urls) in channels.items():
+            for url in urls:
+                if self._should_skip(url, now):
+                    skipped += 1
+                    continue
+                tasks.append((channel_id, info, url))
+        logger.info(f"共 {sum(len(u) for _, u in channels.values())} 个源，"
+                    f"本轮检测 {len(tasks)} 个，退避跳过 {skipped} 个")
+
+        results = {}
+        by_url = {}          # url -> {"info":..., "quality":..., "latency":...}
+        valid = {}           # url -> (valid, latency, quality, reason)
+
+        # --- 第一段：HTTP 预检（高并发）---
+        def probe(task):
+            url = task[2]
+            ok, text, reason = self._probe(url)
+            return task, ok, text, reason
+
+        with ThreadPoolExecutor(max_workers=self.probe_workers) as ex:
+            for task, ok, text, reason in tqdm(ex.map(probe, tasks), total=len(tasks), desc="预检"):
+                url = task[2]
+                if not ok:
+                    valid[url] = (False, float("inf"), {}, reason)
+                    continue
+                by_url[url] = {"quality": self._quality_from_playlist(text)}
+
+        # --- 第二段：ffprobe ---
+        def probe2(url):
+            ok, lat, q, reason = self._ffprobe(url, by_url[url]["quality"])
+            return url, ok, lat, q, reason
+
+        stage2 = list(by_url.keys())
+        with ThreadPoolExecutor(max_workers=self.workers) as ex:
+            for url, ok, lat, q, reason in tqdm(ex.map(probe2, stage2), total=len(stage2), desc="探测"):
+                valid[url] = (ok, lat, q, reason)
+
+        # --- 第三段：每个频道只对前 N 名做静态画面检测 ---
+        cand = {}
+        for channel_id, info, url in tasks:
+            ok, lat, q, reason = valid.get(url, (False, float("inf"), {}, "skipped"))
+            if not ok:
+                continue
+            cand.setdefault(channel_id, []).append({"url": url, "latency": lat, "quality": q, "info": info})
+        freeze_list = []
+        for channel_id, items in cand.items():
+            items.sort(key=self._rank_key)
+            for it in items[:self.top_n]:
+                freeze_list.append((channel_id, it))
+
+        def freeze(pair):
+            channel_id, it = pair
+            return pair, self._is_static(it["url"])
+
+        with ThreadPoolExecutor(max_workers=self.workers) as ex:
+            for (channel_id, it), is_static in tqdm(ex.map(freeze, freeze_list),
+                                                    total=len(freeze_list), desc="静态检测"):
+                if is_static:
+                    valid[it["url"]] = (False, float("inf"), {}, "static")
+
+        # --- 汇总 + 记录状态 ---
+        for channel_id, info, url in tasks:
+            ok, lat, q, reason = valid.get(url, (False, float("inf"), {}, "skipped"))
+            results.setdefault(channel_id, {"info": info, "sources": []})
+            results[channel_id]["sources"].append((url, ok, lat, q))
+            self._remember(url, ok, reason, now)
+
+        n_valid = sum(1 for s in results.values() for x in s["sources"] if x[1])
+        logger.info(f"检测完成：{n_valid}/{len(tasks)} 个源有效（跳过 {skipped} 个未测）")
+        return results

@@ -799,8 +799,22 @@ def main():
         
         # 检查直播源
         if not args.no_check:
-            checker = IPTVSourceChecker(config)
+            # 跨轮状态：失败退避 + 稳定性记忆
+            state_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "state.json")
+            try:
+                with open(state_path, encoding="utf-8") as f:
+                    state_data = json.load(f)
+            except Exception:
+                state_data = {}
+            state_data["round"] = int(state_data.get("round", 0)) + 1
+            checker = IPTVSourceChecker(config, state_data.get("sources", {}), state_data["round"])
             check_results = checker.check(all_channels)
+            try:
+                state_data["sources"] = checker.state
+                with open(state_path, "w", encoding="utf-8") as f:
+                    json.dump(state_data, f, ensure_ascii=False)
+            except Exception as e:
+                logger.warning(f"状态保存失败: {e}")
             
             # 保存结果为JSON文件（仅用于调试或API访问）
             json_output_path = os.path.join(output_dir, "collected_sources.json")

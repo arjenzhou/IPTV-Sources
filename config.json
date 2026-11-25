@@ -204,5 +204,12 @@
   },
   "probe_timeout": 3,
   "max_sources_per_channel": 2,
-  "latency_threshold": 3.0
+  "latency_threshold": 3.0,
+  "probe_workers": 64,
+  "static_check_top_n": 3,
+  "retest_backoff_max": 8,
+  "force_retest_days": 7,
+  "timeout_always_retest": true,
+  "ffmpeg_bin": "ffmpeg",
+  "ffprobe_bin": "ffprobe"
 }

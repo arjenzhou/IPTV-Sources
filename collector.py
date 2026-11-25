@@ -3,6 +3,7 @@
 
 import os
 import logging
+import json
 import requests
 import time
 from urllib.parse import urlparse
@@ -15,6 +16,19 @@ class IPTVSourceCollector:
         self.config = config
         self.sources_dir = os.path.join(os.path.dirname(__file__), "data", "sources")
         os.makedirs(self.sources_dir, exist_ok=True)
+        self.cache_meta_path = os.path.join(os.path.dirname(__file__), "data", "source_cache.json")
+        try:
+            with open(self.cache_meta_path, encoding="utf-8") as f:
+                self._cache_meta = json.load(f)
+        except Exception:
+            self._cache_meta = {}
+
+    def _save_cache_meta(self):
+        try:
+            with open(self.cache_meta_path, "w", encoding="utf-8") as f:
+                json.dump(self._cache_meta, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
         
     def collect(self):
         """收集所有配置的直播源"""
@@ -57,13 +71,21 @@ class IPTVSourceCollector:
                 "User-Agent": self.config.get("user_agent", "Mozilla/5.0"),
                 "Accept": "*/*"
             }
-            
+            meta = self._cache_meta.get(source_url, {})
+            if os.path.exists(local_path) and meta.get("etag"):
+                headers["If-None-Match"] = meta["etag"]
+            if os.path.exists(local_path) and meta.get("last_modified"):
+                headers["If-Modified-Since"] = meta["last_modified"]
+
             response = requests.get(
                 source_url,
                 headers=headers,
                 timeout=30,
                 allow_redirects=True
             )
+            if response.status_code == 304 and os.path.exists(local_path):
+                logger.info(f"源未变化(304)，复用缓存: {source_url}")
+                return local_path
             
             if response.status_code == 200:
                 content = response.text
@@ -84,6 +106,11 @@ class IPTVSourceCollector:
                 with open(local_path, 'w', encoding='utf-8') as f:
                     f.write(content)
                 
+                self._cache_meta[source_url] = {
+                    "etag": response.headers.get("ETag", ""),
+                    "last_modified": response.headers.get("Last-Modified", ""),
+                }
+                self._save_cache_meta()
                 logger.info(f"成功下载源到: {local_path}")
                 return local_path
             else:
@@ -105,11 +132,12 @@ class IPTVSourceCollector:
         if not filename or '.' not in filename:
             filename = f"source_{int(time.time())}.m3u"
             
-        # 添加域名前缀以避免冲突
+        # 用 URL 哈希做稳定文件名，便于条件请求命中 304
+        import hashlib
+        digest = hashlib.md5(url.encode("utf-8")).hexdigest()[:10]
         domain = parsed.netloc.split('.')[-2] if len(parsed.netloc.split('.')) > 1 else parsed.netloc
         domain = domain.replace('-', '_').replace('.', '_')
-        timestamp = int(time.time())
-        safe_filename = f"{domain}_{timestamp}_{filename}"
+        safe_filename = f"{domain}_{digest}_{filename}"
         
         # 确保文件名安全
         import re
