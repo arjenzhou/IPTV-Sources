@@ -16,15 +16,16 @@ from concurrent.futures import ThreadPoolExecutor
 from collector import IPTVSourceCollector
 from checker import IPTVSourceChecker
 
-# 配置日志
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler("iptv_update.log"),
-        logging.StreamHandler()
-    ]
-)
+# 配置日志（轮转：单文件 10MB，保留 3 份）
+from logging.handlers import RotatingFileHandler
+
+_log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "iptv_update.log")
+_fmt = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+_file_handler = RotatingFileHandler(_log_path, maxBytes=10 * 1024 * 1024, backupCount=3, encoding='utf-8')
+_file_handler.setFormatter(_fmt)
+_stream_handler = logging.StreamHandler()
+_stream_handler.setFormatter(_fmt)
+logging.basicConfig(level=logging.INFO, handlers=[_file_handler, _stream_handler])
 logger = logging.getLogger("IPTV-Main")
 
 def load_config():
@@ -308,6 +309,14 @@ def should_exclude_channel(info, url, config):
     
     return False
 
+def _source_host(url):
+    """提取源的主机名/IP，用于去重"""
+    try:
+        return urlparse(url).hostname or url
+    except Exception:
+        return url
+
+
 def organize_channels(sources_data, config):
     """整理频道，去除重复，为每个频道保留最多两个源"""
     logger.info("开始整理频道...")
@@ -328,17 +337,33 @@ def organize_channels(sources_data, config):
         valid_sources = []
         for source in data["sources"]:
             if source["valid"] and not should_exclude_channel(info, source["url"], config):
-                valid_sources.append((source["url"], source["latency"]))
+                valid_sources.append((source["url"], source["latency"], source.get("quality") or {}))
         
         # 如果没有有效源，跳过此频道
         if not valid_sources:
             continue
             
-        # 按延迟排序
-        valid_sources.sort(key=lambda x: x[1])
-        
-        # 保留最多两个源（速度最快和第二快的）
-        best_sources = valid_sources[:min(2, len(valid_sources))]
+        # 延迟只当“及格线”，及格后按画质（分辨率 > 码率）排序，最后才比延迟
+        lat_thr = config.get("latency_threshold", 3.0)
+        valid_sources.sort(key=lambda x: (
+            0 if x[1] <= lat_thr else 1,
+            -int((x[2] or {}).get("height", 0)),
+            -int((x[2] or {}).get("bitrate", 0)),
+            x[1],
+        ))
+
+        # 保留最多 N 个源，且必须来自不同主机/IP，避免主备同时挂
+        max_src = config.get("max_sources_per_channel", 2)
+        best_sources = []
+        seen_hosts = set()
+        for url, latency, quality in valid_sources:
+            host = _source_host(url)
+            if host in seen_hosts:
+                continue
+            seen_hosts.add(host)
+            best_sources.append((url, latency))
+            if len(best_sources) >= max_src:
+                break
         
         # 将频道添加到按名称分组的集合中
         if title in channels_by_name:
@@ -786,8 +811,11 @@ def main():
                 serializable_results[channel_id] = {
                     "info": result["info"],
                     "sources": [
-                        {"url": url, "valid": valid, "latency": latency if latency != float('inf') else -1}
-                        for url, valid, latency in result["sources"]
+                        {"url": url, "valid": valid,
+                         "latency": latency if latency != float('inf') else -1,
+                         "height": (quality or {}).get("height", 0),
+                         "bitrate": (quality or {}).get("bitrate", 0)}
+                        for url, valid, latency, quality in result["sources"]
                     ]
                 }
             

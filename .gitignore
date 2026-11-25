@@ -3,3 +3,9 @@ run.log
 *.bak
 data/sources/
 FETCH_HEAD
+
+# 生成物，不入库
+data/output/collected_sources.json
+logs/
+__pycache__/
+config.full.json
