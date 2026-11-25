@@ -10,3 +10,5 @@ logs/
 __pycache__/
 config.full.json
 data/output/
+data/source_cache.json
+data/state.json
