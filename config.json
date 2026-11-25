@@ -47,7 +47,7 @@
   ],
   "output_dir": "data/output",
   "output_file": "iptv_collection.m3u",
-  "check_timeout": 4,
+  "check_timeout": 3,
   "max_workers": 20,
   "epg_urls": [
     "https://gitee.com/taksssss/tv/raw/main/epg/epgpw_cn.xml.gz",
@@ -206,10 +206,12 @@
   "max_sources_per_channel": 2,
   "latency_threshold": 3.0,
   "probe_workers": 64,
-  "static_check_top_n": 3,
+  "static_check_top_n": 2,
   "retest_backoff_max": 8,
   "force_retest_days": 7,
   "timeout_always_retest": true,
   "ffmpeg_bin": "ffmpeg",
-  "ffprobe_bin": "ffprobe"
+  "ffprobe_bin": "ffprobe",
+  "ffprobe_workers": 32,
+  "freeze_workers": 24
 }

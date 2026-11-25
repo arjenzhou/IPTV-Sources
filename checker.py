@@ -74,7 +74,13 @@ class IPTVSourceChecker:
                     head += chunk
                     if len(head) >= 8192:
                         break
-                return True, head.decode("utf-8", "ignore"), ""
+                text = head.decode("utf-8", "ignore")
+                low = text.lstrip().lower()
+                if low.startswith(("<!doctype", "<html")):
+                    return False, "", "html_page"
+                if "#ext" not in low and len(head) < 256:
+                    return False, "", "not_playlist"
+                return True, text, ""
         except requests.Timeout:
             return False, "", "timeout"
         except Exception:
@@ -103,7 +109,8 @@ class IPTVSourceChecker:
             try:
                 start = time.time()
                 r = subprocess.run(
-                    [self.ffprobe, "-v", "quiet", "-print_format", "json", "-show_streams", "-i", url],
+                    [self.ffprobe, "-v", "quiet", "-print_format", "json", "-show_streams",
+                     "-analyzeduration", "1000000", "-probesize", "500000", "-i", url],
                     capture_output=True, timeout=timeout)
                 latency = time.time() - start
                 if r.returncode != 0:
@@ -182,7 +189,7 @@ class IPTVSourceChecker:
             return url, ok, lat, q, reason
 
         stage2 = list(by_url.keys())
-        with ThreadPoolExecutor(max_workers=self.workers) as ex:
+        with ThreadPoolExecutor(max_workers=self.config.get("ffprobe_workers", 32)) as ex:
             for url, ok, lat, q, reason in tqdm(ex.map(probe2, stage2), total=len(stage2), desc="探测"):
                 valid[url] = (ok, lat, q, reason)
 
@@ -203,7 +210,7 @@ class IPTVSourceChecker:
             channel_id, it = pair
             return pair, self._is_static(it["url"])
 
-        with ThreadPoolExecutor(max_workers=self.workers) as ex:
+        with ThreadPoolExecutor(max_workers=self.config.get("freeze_workers", 24)) as ex:
             for (channel_id, it), is_static in tqdm(ex.map(freeze, freeze_list),
                                                     total=len(freeze_list), desc="静态检测"):
                 if is_static:
