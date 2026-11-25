@@ -1,6 +1,6 @@
 run.log
 *.log
-*.bak
+*.bak*
 data/sources/
 FETCH_HEAD
 
