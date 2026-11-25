@@ -1,3 +1,4 @@
 #!/bin/bash
+# 用 dufs 发布 /srv/dufs（IPTV 订阅在 /iptv/iptv_collection.m3u）
 cd "$(dirname "$0")"
-exec python3 -m http.server 8080 --bind 0.0.0.0 --directory "$PWD/data/output"
+exec "$HOME/bin/dufs" /srv/dufs -b 0.0.0.0 -p 8080 --allow-symlink
